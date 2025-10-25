@@ -1,4 +1,4 @@
-"""Example script showing how to run Difix with batches of input/reference images."""
+"""Quick batch inference example for Difix."""
 
 from pathlib import Path
 
@@ -7,10 +7,10 @@ from diffusers.utils import load_image
 from pipeline_difix import DifixPipeline
 
 
-ASSETS = Path("assets")
+ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
 
-if __name__ == "__main__":
+def main() -> None:
     pipe = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
     pipe.to("cuda")
 
@@ -37,3 +37,7 @@ if __name__ == "__main__":
     )
     for idx, image in enumerate(result.images):
         image.save(f"example_output_{idx}.png")
+
+
+if __name__ == "__main__":
+    main()

@@ -1136,6 +1136,29 @@ class DifixPipeline(
             latents = latents[:, :, 0]
             latents = rearrange(latents, "b n c h w -> (b n) c h w")
 
+            # The VAE skip connections were cached using all input/reference views. Trim them so the
+            # decoder only receives the activations that correspond to the target inputs we will
+            # decode. Without this, the skip tensors and the latent batch would have mismatched
+            # batch dimensions, causing runtime errors during `vae.decode`.
+            if hasattr(self.vae.decoder, "incoming_skip_acts") and self.vae.decoder.incoming_skip_acts is not None:
+                trimmed_skip_acts = []
+                for skip_acts in self.vae.decoder.incoming_skip_acts:
+                    if skip_acts is None:
+                        trimmed_skip_acts.append(None)
+                        continue
+
+                    skip_acts = rearrange(
+                        skip_acts,
+                        "(b n v) c h w -> b n v c h w",
+                        b=batch_size,
+                        n=num_images_per_prompt,
+                        v=views_per_sample,
+                    )
+                    skip_acts = skip_acts[:, :, 0]
+                    trimmed_skip_acts.append(rearrange(skip_acts, "b n c h w -> (b n) c h w"))
+
+                self.vae.decoder.incoming_skip_acts = trimmed_skip_acts
+
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
                 0
