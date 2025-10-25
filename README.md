@@ -56,6 +56,25 @@ output_image = pipe(prompt, image=input_image, ref_image=ref_image, num_inferenc
 output_image.save("example_output.png")
 ```
 
+You can also pass **lists of images** to run several independent pairs in parallel, as the pipeline will broadcast a
+single reference or consume one reference per input when the lengths match:
+
+```
+from pipeline_difix import DifixPipeline
+from diffusers.utils import load_image
+
+pipe = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
+pipe.to("cuda")
+
+input_images = [load_image(path) for path in ["assets/example_input.png", "assets/example_input.png"]]
+ref_images = [load_image(path) for path in ["assets/example_ref.png", "assets/example_ref.png"]]
+prompt = "remove degradation"
+
+results = pipe(prompt, image=input_images, ref_image=ref_images, num_inference_steps=1, timesteps=[199], guidance_scale=0.0)
+for i, image in enumerate(results.images):
+    image.save(f"example_output_{i}.png")
+```
+
 ## Difix: Single-step diffusion for 3D artifact removal
 
 ### Training

@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import PIL.Image
 import torch
+from einops import rearrange
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
@@ -973,13 +974,6 @@ class DifixPipeline(
         self._interrupt = False
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
         device = self._execution_device
 
         # 3. Encode input prompt
@@ -999,6 +993,36 @@ class DifixPipeline(
             clip_skip=self.clip_skip,
         )
 
+        image = self.image_processor.preprocess(image)
+        batch_size = image.shape[0]
+        if ref_image is not None:
+            ref_image = self.image_processor.preprocess(ref_image)
+            if ref_image.shape[0] not in (1, batch_size):
+                raise ValueError(
+                    "`ref_image` must have the same batch size as `image` or contain a single image to broadcast."
+                )
+            if ref_image.shape[0] == 1 and batch_size > 1:
+                ref_image = ref_image.expand(batch_size, -1, -1, -1)
+
+        views_per_sample = 2 if ref_image is not None else 1
+        total_images_per_prompt = num_images_per_prompt * views_per_sample
+
+        prompt_batch_from_embeds = prompt_embeds.shape[0] // num_images_per_prompt
+        if prompt_batch_from_embeds != batch_size:
+            if prompt_batch_from_embeds == 1:
+                prompt_embeds = prompt_embeds.repeat(batch_size, 1, 1)
+                if negative_prompt_embeds is not None:
+                    negative_prompt_embeds = negative_prompt_embeds.repeat(batch_size, 1, 1)
+            else:
+                raise ValueError(
+                    "Mismatch between prompt batch size and image batch size. Provide a prompt for each image or a single prompt to broadcast."
+                )
+
+        if views_per_sample > 1:
+            prompt_embeds = prompt_embeds.repeat_interleave(views_per_sample, dim=0)
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(views_per_sample, dim=0)
+
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
         # to avoid doing two forward passes
@@ -1008,30 +1032,28 @@ class DifixPipeline(
         if ip_adapter_image is not None:
             output_hidden_state = False if isinstance(self.unet.encoder_hid_proj, ImageProjection) else True
             image_embeds, negative_image_embeds = self.encode_image(
-                ip_adapter_image, device, num_images_per_prompt, output_hidden_state
+                ip_adapter_image, device, total_images_per_prompt, output_hidden_state
             )
             if self.do_classifier_free_guidance:
                 image_embeds = torch.cat([negative_image_embeds, image_embeds])
-
-        image = self.image_processor.preprocess(image)
-        if ref_image is not None:
-            ref_image = self.image_processor.preprocess(ref_image)
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
 
         # 5. Prepare latent variables
+        image_inputs = image.unsqueeze(1)
+        if ref_image is not None:
+            image_inputs = torch.stack([image, ref_image], dim=1)
+        latents_input = rearrange(image_inputs, "b v c h w -> (b v) c h w")
+
         latents = self.prepare_latents(
-            torch.cat([image, ref_image], dim=0) if ref_image is not None else image,
+            latents_input,
             batch_size,
-            num_images_per_prompt,
+            total_images_per_prompt,
             prompt_embeds.dtype,
             device,
             generator,
         )
-
-        if ref_image is not None:
-            prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1042,7 +1064,9 @@ class DifixPipeline(
         # 6.2 Optionally get Guidance Scale Embedding
         timestep_cond = None
         if self.unet.config.time_cond_proj_dim is not None:
-            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
+            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
+                batch_size * total_images_per_prompt
+            )
             timestep_cond = self.get_guidance_scale_embedding(
                 guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
@@ -1102,7 +1126,15 @@ class DifixPipeline(
                         callback(step_idx, t, latents)
         
         if ref_image is not None:
-            latents = latents.chunk(2, dim=0)[0]
+            latents = rearrange(
+                latents,
+                "(b n v) c h w -> b n v c h w",
+                b=batch_size,
+                n=num_images_per_prompt,
+                v=views_per_sample,
+            )
+            latents = latents[:, :, 0]
+            latents = rearrange(latents, "b n c h w -> (b n) c h w")
 
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
@@ -1118,8 +1150,6 @@ class DifixPipeline(
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-        if ref_image is not None:
-            image = image.chunk(2, dim=0)[0]
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         # Offload all models
